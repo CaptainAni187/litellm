@@ -136,6 +136,22 @@ async def _is_password_breached(password: str, client: AsyncHTTPHandler) -> bool
     return breached
 
 
+def is_breach_check_enabled(general_settings: Mapping[str, object]) -> bool:
+    return general_settings.get("password_policy_check_breached_passwords", True) is not False
+
+
+async def is_password_breached(
+    password: str,
+    general_settings: Mapping[str, object],
+    client: AsyncHTTPHandler | None = None,
+) -> bool:
+    """False when the check is disabled, the password is absent from the HIBP
+    corpus, or HIBP is unreachable (fail open)."""
+    if not is_breach_check_enabled(general_settings):
+        return False
+    return await _is_password_breached(password, client if client is not None else _hibp_client())
+
+
 async def validate_password_not_breached(
     password: str,
     general_settings: Mapping[str, object],
@@ -144,10 +160,7 @@ async def validate_password_not_breached(
     """Raise ``ProxyException`` (400) if ``password`` appears in a known data breach.
 
     Fails open: an unreachable or misbehaving HIBP allows the password."""
-    check_enabled: Final = general_settings.get("password_policy_check_breached_passwords", True) is not False
-    if not check_enabled:
-        return
-    if not await _is_password_breached(password, client if client is not None else _hibp_client()):
+    if not await is_password_breached(password, general_settings, client):
         return
     raise ProxyException(
         message=(
