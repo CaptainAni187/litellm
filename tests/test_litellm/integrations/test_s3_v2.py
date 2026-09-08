@@ -1,11 +1,16 @@
 import asyncio
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import httpx
 import pytest
+from botocore.credentials import Credentials
 
 from litellm.integrations.s3_v2 import S3Logger
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+from litellm.types.integrations.s3_v2 import s3BatchLoggingElement
 from litellm.types.utils import StandardLoggingPayload
 
 
@@ -342,8 +347,9 @@ class TestS3V2UnitTests:
     def test_s3_v2_put_url_encodes_spaces_in_object_key(
         self, mock_periodic_flush, mock_create_task
     ):
-        import requests
         from unittest.mock import AsyncMock
+
+        import requests
 
         from litellm.types.integrations.s3_v2 import s3BatchLoggingElement
 
@@ -641,6 +647,88 @@ async def test_async_upload_signs_with_frozen_refreshable_credentials():
     headers = logger.async_httpx_client.put.call_args.kwargs["headers"]
     access_key_gen = re.search(r"Credential=AKIA(\d+)/", headers["Authorization"]).group(1)
     assert headers["X-Amz-Security-Token"] == f"token-{access_key_gen}"
+
+
+@asynccontextmanager
+async def _s3_logger_on_production_handler(statuses: list[int]):
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        status = statuses[min(len(requests) - 1, len(statuses) - 1)]
+        body = b"" if status == 200 else b"<Error><Code>SignatureDoesNotMatch</Code></Error>"
+        return httpx.Response(status_code=status, content=body, request=request)
+
+    logger = S3Logger(
+        s3_bucket_name="test-bucket",
+        s3_aws_access_key_id="test-key",
+        s3_aws_secret_access_key="test-secret",
+        s3_region_name="us-east-1",
+    )
+    handler = AsyncHTTPHandler()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        handler.client = client
+        logger.async_httpx_client = handler
+        yield logger, requests
+
+
+@pytest.mark.asyncio
+async def test_async_upload_retries_403_through_production_http_handler():
+    test_element = s3BatchLoggingElement(
+        s3_object_key="2025-09-14/test-403-real-handler.json",
+        payload={"test": "403-real-handler"},
+        s3_object_download_filename="test-403-real-handler.json",
+    )
+
+    async with _s3_logger_on_production_handler([403, 200]) as (logger, requests):
+        rotated = [Credentials("AKIAOLD", "old-secret"), Credentials("AKIANEW", "new-secret")]
+        with (
+            patch.object(logger, "get_credentials", side_effect=rotated),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch.object(logger, "handle_callback_failure") as mock_failure,
+        ):
+            await logger.async_upload_data_to_s3(test_element)
+
+    assert len(requests) == 2
+    assert "Credential=AKIAOLD/" in requests[0].headers["Authorization"]
+    assert "Credential=AKIANEW/" in requests[1].headers["Authorization"]
+    mock_failure.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_async_upload_exhausts_403_retries_through_production_http_handler():
+    test_element = s3BatchLoggingElement(
+        s3_object_key="2025-09-14/test-403-exhaust-real-handler.json",
+        payload={"test": "403-exhaust-real-handler"},
+        s3_object_download_filename="test-403-exhaust-real-handler.json",
+    )
+
+    async with _s3_logger_on_production_handler([403]) as (logger, requests):
+        with (
+            patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            patch.object(logger, "handle_callback_failure") as mock_failure,
+        ):
+            await logger.async_upload_data_to_s3(test_element)
+
+    assert len(requests) == 3
+    assert mock_sleep.call_args_list == [call(1), call(2)]
+    mock_failure.assert_called_once_with(callback_name="S3Logger")
+
+
+@pytest.mark.asyncio
+async def test_async_upload_does_not_retry_404_through_production_http_handler():
+    test_element = s3BatchLoggingElement(
+        s3_object_key="2025-09-14/test-404-real-handler.json",
+        payload={"test": "404-real-handler"},
+        s3_object_download_filename="test-404-real-handler.json",
+    )
+
+    async with _s3_logger_on_production_handler([404]) as (logger, requests):
+        with patch.object(logger, "handle_callback_failure") as mock_failure:
+            await logger.async_upload_data_to_s3(test_element)
+
+    assert len(requests) == 1
+    mock_failure.assert_called_once_with(callback_name="S3Logger")
 
 
 def test_sync_upload_retries_on_s3_503():
