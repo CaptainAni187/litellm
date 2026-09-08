@@ -1,4 +1,5 @@
 import asyncio
+import re
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -528,12 +529,12 @@ async def test_async_upload_no_retry_on_4xx():
         s3_object_download_filename="test-no-retry.json",
     )
 
-    response_403 = MagicMock()
-    response_403.status_code = 403
-    response_403.raise_for_status = MagicMock(side_effect=Exception("403 Forbidden"))
+    response_400 = MagicMock()
+    response_400.status_code = 400
+    response_400.raise_for_status = MagicMock(side_effect=Exception("400 Bad Request"))
 
     logger.async_httpx_client = AsyncMock()
-    logger.async_httpx_client.put = AsyncMock(return_value=response_403)
+    logger.async_httpx_client.put = AsyncMock(return_value=response_400)
 
     with patch.object(logger, "handle_callback_failure") as mock_failure:
         await logger.async_upload_data_to_s3(test_element)
@@ -541,6 +542,105 @@ async def test_async_upload_no_retry_on_4xx():
     # Only 1 attempt — no retry for 4xx
     assert logger.async_httpx_client.put.call_count == 1
     mock_failure.assert_called_once_with(callback_name="S3Logger")
+
+
+@pytest.mark.asyncio
+async def test_async_upload_retries_403_with_fresh_credentials_and_signature():
+    """
+    A 403 (e.g. SignatureDoesNotMatch after an IMDS credential rotation) must be retried,
+    and the retry must re-fetch credentials and carry a freshly computed signature.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from botocore.credentials import Credentials
+
+    from litellm.types.integrations.s3_v2 import s3BatchLoggingElement
+
+    logger = S3Logger(s3_bucket_name="test-bucket", s3_region_name="us-east-1")
+    test_element = s3BatchLoggingElement(
+        s3_object_key="2025-09-14/test-403.json",
+        payload={"test": "403"},
+        s3_object_download_filename="test-403.json",
+    )
+
+    response_403 = MagicMock()
+    response_403.status_code = 403
+    response_200 = MagicMock()
+    response_200.status_code = 200
+    response_200.raise_for_status = MagicMock()
+    logger.async_httpx_client = AsyncMock()
+    logger.async_httpx_client.put = AsyncMock(side_effect=[response_403, response_200])
+
+    rotated = [Credentials("AKIAOLD", "old-secret"), Credentials("AKIANEW", "new-secret")]
+    with (
+        patch.object(logger, "get_credentials", side_effect=rotated) as mock_get_credentials,
+        patch("asyncio.sleep", new_callable=AsyncMock),
+        patch.object(logger, "handle_callback_failure") as mock_failure,
+    ):
+        await logger.async_upload_data_to_s3(test_element)
+
+    assert logger.async_httpx_client.put.call_count == 2
+    assert mock_get_credentials.call_count == 2
+    first_auth = logger.async_httpx_client.put.call_args_list[0].kwargs["headers"]["Authorization"]
+    second_auth = logger.async_httpx_client.put.call_args_list[1].kwargs["headers"]["Authorization"]
+    assert "Credential=AKIAOLD/" in first_auth
+    assert "Credential=AKIANEW/" in second_auth
+    mock_failure.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_async_upload_signs_with_frozen_refreshable_credentials():
+    """
+    RefreshableCredentials refreshes on every property read, so a refresh landing mid-signature
+    mixes an old access key with a new secret/token (S3 403). The signer must use one frozen snapshot.
+    """
+    import itertools
+    from unittest.mock import AsyncMock, MagicMock
+
+    from botocore.credentials import ReadOnlyCredentials, RefreshableCredentials
+
+    from litellm.types.integrations.s3_v2 import s3BatchLoggingElement
+
+    class RotatingEveryRead(RefreshableCredentials):
+        """Every property read observes a newer credential generation, like a concurrent refresh."""
+
+        def __init__(self):
+            self._gen = itertools.count()
+
+        @property
+        def access_key(self):
+            return f"AKIA{next(self._gen)}"
+
+        @property
+        def secret_key(self):
+            return f"secret-{next(self._gen)}"
+
+        @property
+        def token(self):
+            return f"token-{next(self._gen)}"
+
+        def get_frozen_credentials(self):
+            n = next(self._gen)
+            return ReadOnlyCredentials(f"AKIA{n}", f"secret-{n}", f"token-{n}")
+
+    logger = S3Logger(s3_bucket_name="test-bucket", s3_region_name="us-east-1")
+    test_element = s3BatchLoggingElement(
+        s3_object_key="2025-09-14/test-frozen.json",
+        payload={"test": "frozen"},
+        s3_object_download_filename="test-frozen.json",
+    )
+    response_200 = MagicMock()
+    response_200.status_code = 200
+    response_200.raise_for_status = MagicMock()
+    logger.async_httpx_client = AsyncMock()
+    logger.async_httpx_client.put = AsyncMock(return_value=response_200)
+
+    with patch.object(logger, "get_credentials", return_value=RotatingEveryRead()):
+        await logger.async_upload_data_to_s3(test_element)
+
+    headers = logger.async_httpx_client.put.call_args.kwargs["headers"]
+    access_key_gen = re.search(r"Credential=AKIA(\d+)/", headers["Authorization"]).group(1)
+    assert headers["X-Amz-Security-Token"] == f"token-{access_key_gen}"
 
 
 def test_sync_upload_retries_on_s3_503():
