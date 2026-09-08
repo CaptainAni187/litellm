@@ -9,7 +9,7 @@ import {
   setLocalStorageItem,
 } from "@/utils/localStorageUtils";
 import { navAccountDisplayName } from "@/components/Navbar/navDisplayName";
-import { migratedHref } from "@/utils/migratedPages";
+import { uiHref } from "@/utils/uiHref";
 import { ChevronDown, ChevronsUpDown, Crown, KeyRound, LogOut, Mail, ShieldCheck, User } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -267,7 +267,7 @@ const UserDropdown: React.FC<UserDropdownProps> = ({ onLogout, variant = "navbar
             type="button"
             onClick={() => {
               setOpen(false);
-              router.push(migratedHref("change-password"));
+              router.push(uiHref("change-password"));
             }}
             className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent"
           >
