@@ -14,7 +14,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/cva.config";
-import { migratedHref } from "@/utils/migratedPages";
+import { uiHref } from "@/utils/uiHref";
 import { ChevronsUpDown, Crown, IdCard, KeyRound, LogOut, Mail, ShieldCheck } from "lucide-react";
 import { useRouter } from "next/navigation";
 import React from "react";
@@ -244,7 +244,7 @@ const SidebarAccountMenu: React.FC<SidebarAccountMenuProps> = ({ onLogout, colla
             variant="ghost"
             onClick={() => {
               setOpen(false);
-              router.push(migratedHref("change-password"));
+              router.push(uiHref("change-password"));
             }}
             className="h-[42px] w-full justify-start gap-2.5 rounded-none px-3 text-sm font-medium text-foreground"
           >
