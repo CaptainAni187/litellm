@@ -18,6 +18,7 @@ from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import AllMessageValues, ResponsesAPIResponse, ResponsesTerminalEvent
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import CallTypes, EmbeddingResponse, ImageResponse
+from litellm.utils import _add_path_to_api_base
 
 if TYPE_CHECKING:
     from httpx import URL
@@ -89,15 +90,25 @@ class AzurePassthroughConfig(BasePassthroughConfig):
         native_endpoint: Final = strip_leading_model_segment(routed_endpoint, (model,))
 
         caller_api_version: Final = request_query_params.get("api-version") if request_query_params else None
-        complete_url: Final = BaseAzureLLM._get_base_azure_url(
-            api_base=base_target_url,
-            litellm_params={**litellm_params, "api_version": caller_api_version or litellm_params.get("api_version")},
-            route=native_endpoint,
+        base_url: Final = httpx.URL(base_target_url)
+        embedded_params: Final = tuple((k, v) for k, v in base_url.params.multi_items() if k != "api-version")
+        resolved_api_version: Final = (
+            caller_api_version or litellm_params.get("api_version") or base_url.params.get("api-version")
         )
-        return (
-            httpx.URL(complete_url),
-            base_target_url,
+
+        sanitized_base: Final = str(base_url.copy_with(params=httpx.QueryParams(embedded_params)))
+        joined_url: Final = (
+            sanitized_base
+            if native_endpoint in sanitized_base
+            else _add_path_to_api_base(api_base=sanitized_base, ending_path=native_endpoint)
         )
+        final_params: Final = (
+            (*embedded_params, ("api-version", resolved_api_version))
+            if resolved_api_version
+            else embedded_params
+        )
+        complete_url: Final = httpx.URL(joined_url).copy_with(params=httpx.QueryParams(final_params))
+        return (complete_url, base_target_url)
 
     def validate_environment(
         self,

@@ -369,6 +369,46 @@ def test_azure_passthrough_url_fills_in_the_deployments_api_version_when_the_cal
     assert url.params["api-version"] == "2024-10-21"
 
 
+def test_azure_passthrough_url_prefers_the_callers_api_version_over_the_one_embedded_in_a_full_url_api_base():
+    url, _ = AzurePassthroughConfig().get_complete_url(
+        api_base=(
+            "https://my-resource.openai.azure.com/openai/deployments/gpt-4.1-mini/chat/completions"
+            "?api-version=2024-10-21"
+        ),
+        api_key="key",
+        model="gpt-4.1-mini",
+        endpoint="openai/deployments/gpt-4.1-mini/chat/completions",
+        request_query_params={"api-version": "2025-04-01-preview"},
+        litellm_params={},
+    )
+
+    assert url.path == "/openai/deployments/gpt-4.1-mini/chat/completions"
+    assert url.params["api-version"] == "2025-04-01-preview"
+
+
+def test_azure_passthrough_url_keeps_the_api_version_embedded_in_a_full_url_api_base_when_the_caller_sends_none():
+    url, _ = AzurePassthroughConfig().get_complete_url(
+        api_base=(
+            "https://my-resource.openai.azure.com/openai/deployments/gpt-4.1-mini/chat/completions"
+            "?api-version=2024-10-21"
+        ),
+        api_key="key",
+        model="gpt-4.1-mini",
+        endpoint="openai/deployments/gpt-4.1-mini/chat/completions",
+        request_query_params={},
+        litellm_params={},
+    )
+
+    assert url.params["api-version"] == "2024-10-21"
+
+
+def test_azure_passthrough_url_does_not_rewrite_the_deployments_path_to_v1_when_the_caller_asks_for_preview():
+    url = _complete_url(request_query_params={"api-version": "preview"}, litellm_params={})
+
+    assert url.path == "/openai/deployments/gpt-4.1-mini/chat/completions"
+    assert url.params["api-version"] == "preview"
+
+
 def test_azure_passthrough_url_strips_the_leading_router_model_segment():
     url, _ = AzurePassthroughConfig().get_complete_url(
         api_base="https://my-resource.openai.azure.com",
