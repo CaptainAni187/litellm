@@ -3109,6 +3109,63 @@ class TestBedrockFileListTransformation:
         assert _sent_signature(request.headers) == _s3_signature_for("GET", str(request.url), request.headers)
         assert [file.id for file in files] == [self.OUTPUT_BUCKET_ID]
 
+    def test_file_list_unsupported_purpose_returns_empty_without_scanning_prefix(self, monkeypatch):
+        """
+        Purposes Bedrock does not serve (e.g. `user_data`) must not scan the
+        wide `litellm-b` prefix. `_managed_listing_prefix` uses a sentinel that
+        no managed key matches so S3 returns one empty page and pagination
+        terminates instead of pinning the worker on every continuation token.
+        """
+        import httpx
+        import respx
+
+        import litellm
+
+        monkeypatch.setenv("AWS_S3_BUCKET_NAME", "my-bucket")
+        unserved_query = {"list-type": "2", "prefix": "litellm-b/"}
+        empty_listing = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+            b"<Name>my-bucket</Name></ListBucketResult>"
+        )
+
+        with respx.mock:
+            route = respx.get(self.BUCKET_URL, params__contains=unserved_query).mock(
+                return_value=httpx.Response(200, content=empty_listing)
+            )
+            files = litellm.file_list(custom_llm_provider="bedrock", purpose="user_data", **_bedrock_s3_params())
+
+        assert files == []
+        assert route.call_count == 1
+
+    def test_file_list_batch_output_uses_output_bucket_without_input_bucket(self, monkeypatch):
+        """
+        `_listing_bucket_name` for `batch_output` must not require an input
+        bucket. Delete accepts an output-only snapshot via
+        `get_configured_s3_bucket_names`; listing has to match, or an
+        output-only deployment can delete a batch result but fails to list it.
+        """
+        import httpx
+        import respx
+
+        import litellm
+
+        monkeypatch.delenv("AWS_S3_BUCKET_NAME", raising=False)
+        monkeypatch.delenv("AWS_S3_OUTPUT_BUCKET_NAME", raising=False)
+
+        with respx.mock:
+            route = respx.get(self.OUTPUT_BUCKET_URL, params__contains=self.OUTPUT_QUERY).mock(
+                return_value=httpx.Response(200, content=self.OUTPUT_BUCKET_LISTING)
+            )
+            files = litellm.file_list(
+                custom_llm_provider="bedrock",
+                purpose="batch_output",
+                **_trusted_bucket_snapshot(s3_output_bucket_name="my-output-bucket"),
+            )
+
+        assert route.called
+        assert [file.id for file in files] == [self.OUTPUT_BUCKET_ID]
+
     def test_transform_list_files_next_request_signs_the_continuation_page(self, monkeypatch):
         import httpx
 

@@ -270,11 +270,16 @@ _MANAGED_LISTING_PREFIX_BY_PURPOSE: Final = MappingProxyType(
         "batch_output": BEDROCK_MANAGED_S3_OUTPUT_PREFIX,
     }
 )
+# Sentinel prefix for purposes Bedrock does not serve (e.g. `user_data`). No
+# managed key can start with `litellm-b/`, so S3 returns one empty page and
+# pagination terminates instead of scanning the wide `litellm-b` prefix and
+# discarding every object because none match the requested purpose.
+_UNSERVED_LISTING_PREFIX: Final = f"{_ANY_MANAGED_LISTING_PREFIX}/"
 
 
 def _managed_listing_prefix(configured_prefix: str, purpose: str | None) -> str:
     managed_prefix: Final = (
-        _MANAGED_LISTING_PREFIX_BY_PURPOSE.get(purpose, _ANY_MANAGED_LISTING_PREFIX)
+        _MANAGED_LISTING_PREFIX_BY_PURPOSE.get(purpose, _UNSERVED_LISTING_PREFIX)
         if purpose
         else _ANY_MANAGED_LISTING_PREFIX
     )
@@ -287,11 +292,12 @@ def _requested_listing_purpose(litellm_params: Mapping[str, object]) -> str | No
 
 
 def _listing_bucket_name(litellm_params: Mapping[str, object], purpose: str | None) -> str:
-    input_bucket_name: Final = get_configured_s3_bucket_name(litellm_params)
-    if purpose != "batch_output":
-        return input_bucket_name
-    trusted: Final = _trusted_s3_model_credentials(litellm_params)
-    return trusted.s3_output_bucket_name or os.getenv("AWS_S3_OUTPUT_BUCKET_NAME") or input_bucket_name
+    if purpose == "batch_output":
+        trusted: Final = _trusted_s3_model_credentials(litellm_params)
+        output_bucket: Final = trusted.s3_output_bucket_name or os.getenv("AWS_S3_OUTPUT_BUCKET_NAME")
+        if output_bucket:
+            return output_bucket
+    return get_configured_s3_bucket_name(litellm_params)
 
 
 def _listed_object_created_at(entry: ET.Element) -> int:
