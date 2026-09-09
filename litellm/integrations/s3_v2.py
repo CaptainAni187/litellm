@@ -239,7 +239,7 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
 
     def _sign_put(
         self, credentials: "Credentials", url: str, json_string: str, headers: Mapping[str, str]
-    ) -> dict[str, str]:
+    ) -> dict[str, str]:  # mutable-ok: [LIT001] AsyncHTTPHandler.put/HTTPHandler.put only accept dict headers
         """
         ``RefreshableCredentials`` (IMDS roles) may refresh between the access key, secret and token
         reads SigV4 performs, producing a mixed-generation signature that S3 rejects with 403.
@@ -349,19 +349,6 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
 
             asyncified_get_credentials: Final = asyncify(self.get_credentials)
 
-            async def fetch_credentials() -> "Credentials":
-                return await asyncified_get_credentials(
-                    aws_access_key_id=self.s3_aws_access_key_id,
-                    aws_secret_access_key=self.s3_aws_secret_access_key,
-                    aws_session_token=self.s3_aws_session_token,
-                    aws_region_name=self.s3_region_name,
-                    aws_session_name=self.s3_aws_session_name,
-                    aws_profile_name=self.s3_aws_profile_name,
-                    aws_role_name=self.s3_aws_role_name,
-                    aws_web_identity_token=self.s3_aws_web_identity_token,
-                    aws_sts_endpoint=self.s3_aws_sts_endpoint,
-                )
-
             verbose_logger.debug("s3_v2 logger - uploading data to s3 - %s", batch_logging_element.s3_object_key)
             verbose_logger.debug("s3_v2 logger - s3_verify setting: %s", self.s3_verify)
 
@@ -387,19 +374,29 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
                 **self._sse_headers(),
             }
 
+            async def signed_put() -> httpx.Response:
+                credentials: Final = await asyncified_get_credentials(
+                    aws_access_key_id=self.s3_aws_access_key_id,
+                    aws_secret_access_key=self.s3_aws_secret_access_key,
+                    aws_session_token=self.s3_aws_session_token,
+                    aws_region_name=self.s3_region_name,
+                    aws_session_name=self.s3_aws_session_name,
+                    aws_profile_name=self.s3_aws_profile_name,
+                    aws_role_name=self.s3_aws_role_name,
+                    aws_web_identity_token=self.s3_aws_web_identity_token,
+                    aws_sts_endpoint=self.s3_aws_sts_endpoint,
+                )
+                signed_headers: Final = self._sign_put(credentials, url, json_string, headers)
+                try:
+                    return await self.async_httpx_client.put(url, data=json_string, headers=signed_headers)
+                except httpx.HTTPStatusError as error:
+                    return error.response
+
             max_retries: Final = 3
             for attempt in range(max_retries):
-                signed_headers = self._sign_put(  # rebind-ok: [LIT010] each attempt needs a fresh signature
-                    await fetch_credentials(), url, json_string, headers
-                )
-                try:
-                    response = await self.async_httpx_client.put(  # rebind-ok: [LIT010] one response per attempt
-                        url, data=json_string, headers=signed_headers
-                    )
-                except httpx.HTTPStatusError as error:
-                    response = error.response  # rebind-ok: [LIT010] the handler raises instead of returning non-2xx
+                response = await signed_put()
                 if response.status_code in (403, 500, 503) and attempt < max_retries - 1:
-                    wait_time = 2**attempt  # rebind-ok: [LIT010] backoff depends on the current attempt
+                    wait_time = 2**attempt  # 1s, 2s
                     verbose_logger.warning(
                         "S3 upload returned %s, retrying in %ss (attempt %s/%s) key=%s",
                         response.status_code,
@@ -502,20 +499,10 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
         try:
             import base64
             import hashlib
-
-            from botocore.credentials import Credentials
         except ImportError:
             raise ImportError("Missing boto3 to call bedrock. Run 'pip install boto3'.")
         try:
             verbose_logger.debug("s3_v2 logger - uploading data to s3 - %s", batch_logging_element.s3_object_key)
-
-            def fetch_credentials() -> Credentials:
-                return self.get_credentials(
-                    aws_access_key_id=self.s3_aws_access_key_id,
-                    aws_secret_access_key=self.s3_aws_secret_access_key,
-                    aws_session_token=self.s3_aws_session_token,
-                    aws_region_name=self.s3_region_name,
-                )
 
             url: Final = self._build_object_url(batch_logging_element.s3_object_key)
 
@@ -542,10 +529,20 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
             httpx_client: Final = _get_httpx_client(
                 params=({"ssl_verify": self.s3_verify} if self.s3_verify is not None else None)
             )
+
+            def signed_put() -> httpx.Response:
+                credentials: Final = self.get_credentials(
+                    aws_access_key_id=self.s3_aws_access_key_id,
+                    aws_secret_access_key=self.s3_aws_secret_access_key,
+                    aws_session_token=self.s3_aws_session_token,
+                    aws_region_name=self.s3_region_name,
+                )
+                signed_headers: Final = self._sign_put(credentials, url, json_string, headers)
+                return httpx_client.put(url, data=json_string, headers=signed_headers)
+
             max_retries: Final = 3
             for attempt in range(max_retries):
-                signed_headers = self._sign_put(fetch_credentials(), url, json_string, headers)
-                response = httpx_client.put(url, data=json_string, headers=signed_headers)
+                response = signed_put()
                 if response.status_code in (403, 500, 503) and attempt < max_retries - 1:
                     wait_time = 2**attempt  # 1s, 2s
                     verbose_logger.warning(
