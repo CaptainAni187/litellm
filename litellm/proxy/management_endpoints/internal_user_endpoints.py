@@ -575,7 +575,7 @@ async def new_user(
         # generate_key_helper_fn only forwards object_permission_id, so without this the entitlement
         # the caller sent would be dropped on the floor.
         data_json = await _set_object_permission(data_json=data_json, prisma_client=prisma_client)
-        data_json.pop("password", None)  # always None: NewUserRequest.password_not_supported rejects any other value
+        data_json.pop("password", None)
         teams = data.teams
         if teams is None:
             teams = check_if_default_team_set()
@@ -1869,15 +1869,13 @@ async def bulk_user_update(
                 detail="Only proxy admins can update all users at once.",
             )
         if data.user_updates.password is not None:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": (
-                        "Setting one password for all users is not supported. "
-                        "Use per-user updates via the 'users' list instead."
-                    )
-                },
-            )
+            bulk_password_error: Final[HTTPExceptionErrorDetail] = {
+                "error": (
+                    "Setting one password for all users is not supported. "
+                    "Use per-user updates via the 'users' list instead."
+                )
+            }
+            raise HTTPException(status_code=400, detail=bulk_password_error)
         # Optimized path for updating all users directly in database
         all_users_in_db: Final = await _user_table(prisma_client).find_many(order={"created_at": "desc"})
 
