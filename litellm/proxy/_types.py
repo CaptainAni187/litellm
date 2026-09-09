@@ -3719,6 +3719,12 @@ class AllCallbacks(LiteLLMPydanticObjectBase):
     )
 
 
+class HTTPExceptionErrorDetail(TypedDict):
+    """The `{"error": <message>}` shape most proxy endpoints raise as `HTTPException.detail`."""
+
+    error: ReadOnly[str]
+
+
 class SpendLogsRouterMetadata(TypedDict):
     """
     Router provenance stamped on spend logs for deployments flagged with
