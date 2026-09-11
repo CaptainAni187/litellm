@@ -1365,3 +1365,105 @@ class TestToolPermissionGuardrailAnthropicMessages:
         with patch.object(self.blocking, "should_run_guardrail", return_value=True):
             with pytest.raises(GuardrailRaisedException):
                 await self._drain(self.blocking, [b"data: not-json\n\n", b"event: weird\n\n"])
+
+
+class TestToolPermissionGuardrailAnthropicRequestTools:
+    """Tool definitions sent to /v1/messages carry a flat `name` and no `type: function`,
+    so the request-side rules never saw them and every Anthropic-native client's tools
+    passed through regardless of the configured rules.
+    """
+
+    def setup_method(self):
+        rules = [
+            {"id": "allow_bash", "tool_name": r"^Bash$", "decision": "allow"},
+            {"id": "deny_mcp", "tool_name": r"^mcp__.*$", "decision": "deny"},
+        ]
+        self.blocking = ToolPermissionGuardrail(
+            guardrail_name="anthropic-request-block",
+            rules=rules,
+            default_action="allow",
+            on_disallowed_action="block",
+        )
+        self.rewriting = ToolPermissionGuardrail(
+            guardrail_name="anthropic-request-rewrite",
+            rules=rules,
+            default_action="allow",
+            on_disallowed_action="rewrite",
+        )
+
+    async def _pre_call(self, guardrail, data):
+        with patch.object(guardrail, "should_run_guardrail", return_value=True):
+            return await guardrail.async_pre_call_hook(
+                user_api_key_dict=UserAPIKeyAuth(),
+                cache=DualCache(default_in_memory_ttl=1),
+                data=data,
+                call_type="anthropic_messages",
+            )
+
+    @pytest.mark.parametrize(
+        "denied_tool",
+        [
+            pytest.param({"name": "mcp__srv__tool", "input_schema": {"type": "object"}}, id="anthropic_tool"),
+            pytest.param({"type": "web_search_20250305", "name": "mcp__srv__tool"}, id="anthropic_server_tool"),
+            pytest.param(
+                {"type": "function", "name": "mcp__srv__tool", "function": {"name": "Bash"}},
+                id="denied_flat_name_behind_allowed_function_name",
+            ),
+            pytest.param(
+                {"type": "function", "name": "Bash", "function": {"name": "mcp__srv__tool"}},
+                id="denied_function_name_behind_allowed_flat_name",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_denied_tool_definition_is_blocked(self, denied_tool):
+        with pytest.raises(HTTPException) as excinfo:
+            await self._pre_call(self.blocking, {"tools": [denied_tool]})
+
+        assert excinfo.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_anthropic_tool_choice_forcing_a_denied_tool_is_blocked(self):
+        data = {
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "tool", "name": "mcp__srv__tool"},
+        }
+
+        with pytest.raises(HTTPException) as excinfo:
+            await self._pre_call(self.blocking, data)
+
+        assert excinfo.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_allowed_anthropic_tool_passes_through_untouched(self):
+        data = {"tools": [{"name": "Bash", "input_schema": {"type": "object"}}]}
+
+        new_data = await self._pre_call(self.blocking, data)
+
+        assert new_data["tools"] == data["tools"]
+
+    @pytest.mark.asyncio
+    async def test_rewrite_drops_the_denied_anthropic_tool_and_clears_the_forced_choice(self):
+        data = {
+            "tools": [
+                {"name": "Bash", "input_schema": {"type": "object"}},
+                {"name": "mcp__srv__tool", "input_schema": {"type": "object"}},
+            ],
+            "tool_choice": {"type": "tool", "name": "mcp__srv__tool"},
+        }
+
+        new_data = await self._pre_call(self.rewriting, data)
+
+        assert [tool["name"] for tool in new_data["tools"]] == ["Bash"]
+        assert new_data["tool_choice"] == {"type": "none"}
+
+    @pytest.mark.asyncio
+    async def test_rewrite_still_clears_an_openai_forced_choice_with_the_string(self):
+        data = {
+            "tools": [{"type": "function", "function": {"name": "Bash"}}],
+            "tool_choice": {"type": "function", "function": {"name": "mcp__srv__tool"}},
+        }
+
+        new_data = await self._pre_call(self.rewriting, data)
+
+        assert new_data["tool_choice"] == "none"

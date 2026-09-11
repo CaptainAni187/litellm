@@ -24,6 +24,7 @@ from litellm.proxy.guardrails.anthropic_sse import (
     is_raw_sse_stream,
 )
 from litellm.types.guardrails import GuardrailEventHooks, LitellmParams
+from litellm.types.llms.anthropic import AnthropicMessagesToolChoice
 from litellm.types.proxy.guardrails.guardrail_hooks.tool_permission import (
     PermissionError,
     ToolPermissionRule,
@@ -605,14 +606,15 @@ class ToolPermissionGuardrail(CustomGuardrail):
         if not any(_is_tool_use_block(block) for block in kept_blocks):
             response["stop_reason"] = "end_turn"  # rebind-ok: dropping every tool_use ends the turn
 
-    def _get_request_tool_name(self, tool: object) -> tuple[str | None, str | None]:
+    def _get_request_tool_names(self, tool: object) -> tuple[tuple[str, str | None], ...]:
+        """Every name a tool can act under, in either request format: the flat name
+        /v1/messages tools and Anthropic server tools carry, and the OpenAI
+        `function.name`. Reading only one lets a decoy in the other slot carry a
+        denied tool past the rules."""
         tool_type: Final = self._get_mapping_value(tool, "type")
-        if tool_type != "function":
-            return None, tool_type
-
-        function: Final = self._get_mapping_value(tool, "function")
-        tool_name: Final = self._get_mapping_value(function, "name")
-        return tool_name, tool_type
+        function: Final = self._get_mapping_value(tool, "function") if tool_type == "function" else None
+        names: Final = (self._get_mapping_value(tool, "name"), self._get_mapping_value(function, "name"))
+        return tuple((name, tool_type) for name in names if isinstance(name, str) and name)
 
     def _get_legacy_function_name(self, function: object) -> str | None:
         return self._get_mapping_value(function, "name")
@@ -623,9 +625,17 @@ class ToolPermissionGuardrail(CustomGuardrail):
             return None
         if isinstance(tool_choice, str):
             return tool_choice
-        if self._get_mapping_value(tool_choice, "type") != "function":
-            return None
-        return self._get_mapping_value(self._get_mapping_value(tool_choice, "function"), "name")
+        if self._get_mapping_value(tool_choice, "type") == "function":
+            return self._get_mapping_value(self._get_mapping_value(tool_choice, "function"), "name")
+        return self._get_mapping_value(tool_choice, "name")
+
+    def _cleared_tool_choice(self, tool_choice: object) -> str | AnthropicMessagesToolChoice:
+        """A forced tool that got denied has to be cleared in the format the request came
+        in: /v1/messages rejects the bare OpenAI string."""
+        if isinstance(tool_choice, str) or self._get_mapping_value(tool_choice, "type") == "function":
+            return "none"
+        cleared: Final[AnthropicMessagesToolChoice] = {"type": "none"}
+        return cleared
 
     def _get_named_function_call(self, data: dict) -> str | None:
         function_call: Final = data.get("function_call")
@@ -639,9 +649,7 @@ class ToolPermissionGuardrail(CustomGuardrail):
         request_tools: Final[list[tuple[str, str | None]]] = []
 
         for tool in data.get("tools") or []:
-            tool_name, tool_type = self._get_request_tool_name(tool)
-            if tool_name is not None:
-                request_tools.append((tool_name, tool_type))
+            request_tools.extend(self._get_request_tool_names(tool))
 
         for function in data.get("functions") or []:
             function_name = self._get_legacy_function_name(function)
@@ -683,8 +691,7 @@ class ToolPermissionGuardrail(CustomGuardrail):
         if tools is not None:
             new_tools: Final = []
             for tool in tools:
-                tool_name, tool_type = self._get_request_tool_name(tool)
-                if tool_type == "function" and tool_name in error_tool_names:
+                if any(name in error_tool_names for name, _ in self._get_request_tool_names(tool)):
                     continue
                 new_tools.append(tool)
             data["tools"] = new_tools
@@ -697,7 +704,7 @@ class ToolPermissionGuardrail(CustomGuardrail):
 
         named_tool_choice: Final = self._get_named_tool_choice(data)
         if named_tool_choice in error_tool_names:
-            data["tool_choice"] = "none"
+            data["tool_choice"] = self._cleared_tool_choice(data.get("tool_choice"))
 
         named_function_call: Final = self._get_named_function_call(data)
         if named_function_call in error_tool_names:
